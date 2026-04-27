@@ -1890,6 +1890,22 @@ OPT = {
             "temperature_scale": 0.98,
         },
     ],
+
+    # Optional SED ensemble from the 0.934 notebook. Attach these datasets on Kaggle:
+    # - needless090/birdclef2026-sed-ensemble
+    # - needless090/birdclef2026-sed-v5-trio
+    "use_sed_rank_ensemble": True,
+    "sed_rank_weight_perch": 0.70,
+    "sed_rank_weight_sed": 0.30,
+    "sed_ensemble_dirs": [
+        "/kaggle/input/datasets/needless090/birdclef2026-sed-ensemble",
+        "/kaggle/input/birdclef2026-sed-ensemble",
+    ],
+    "sed_v5_dirs": [
+        "/kaggle/input/datasets/needless090/birdclef2026-sed-v5-trio",
+        "/kaggle/input/birdclef2026-sed-v5-trio",
+    ],
+    "sed_mirror_sonotypes": True,
 }
 print("OPT knobs:", OPT)
 
@@ -2113,6 +2129,273 @@ if OPT["use_config_ensemble"]:
     print(f"Config ensemble: averaged {len(probs_views)} views")
 else:
     probs = make_probs_from_components({"name": "single"})
+
+
+# Step J: Optional SED rank ensemble from the 0.934 Perch+SED notebook
+# This is skipped automatically unless the external SED weight datasets are attached.
+def apply_optional_sed_rank_ensemble(probs_in):
+    if not OPT.get("use_sed_rank_ensemble", True):
+        print("SED rank ensemble disabled")
+        return probs_in
+
+    try:
+        from scipy.stats import rankdata
+        import librosa
+        import timm
+        import torchaudio
+    except Exception as exc:
+        print(f"SED rank ensemble skipped: missing dependency ({exc})")
+        return probs_in
+
+    sed_start = time.time()
+
+    def _torch_load_state(path):
+        try:
+            return torch.load(path, map_location="cpu", weights_only=True)
+        except TypeError:
+            return torch.load(path, map_location="cpu")
+
+    class _SEDB0(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = timm.create_model(
+                "tf_efficientnet_b0.ns_jft_in1k",
+                pretrained=False,
+                in_chans=3,
+                num_classes=0,
+                global_pool="",
+                drop_path_rate=0.15,
+            )
+            self.freq_pool = nn.AdaptiveAvgPool2d((1, None))
+            self.att = nn.Linear(1280, 1)
+            self.fc = nn.Linear(1280, N_CLASSES)
+            self.dropout = nn.Dropout(0.3)
+
+        def forward(self, x):
+            f = self.encoder(x)
+            f = self.freq_pool(f).squeeze(2).permute(0, 2, 1)
+            w = torch.softmax(self.att(f), dim=1)
+            return self.fc(self.dropout((f * w).sum(dim=1)))
+
+    class _SEDB3(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = timm.create_model(
+                "tf_efficientnet_b3.ns_jft_in1k",
+                pretrained=False,
+                in_chans=3,
+                num_classes=0,
+                global_pool="",
+                drop_path_rate=0.15,
+            )
+            self.freq_pool = nn.AdaptiveAvgPool2d((1, None))
+            self.att = nn.Linear(1536, 1)
+            self.fc = nn.Linear(1536, N_CLASSES)
+            self.dropout = nn.Dropout(0.3)
+
+        def forward(self, x):
+            f = self.encoder(x)
+            f = self.freq_pool(f).squeeze(2).permute(0, 2, 1)
+            w = torch.softmax(self.att(f), dim=1)
+            return self.fc(self.dropout((f * w).sum(dim=1)))
+
+    class AttentionPool(nn.Module):
+        def __init__(self, in_features):
+            super().__init__()
+            self.attention = nn.Sequential(
+                nn.Linear(in_features, in_features),
+                nn.Tanh(),
+                nn.Linear(in_features, 1),
+            )
+
+        def forward(self, x):
+            w = self.attention(x)
+            w = F.softmax(w, dim=1)
+            return (x * w).sum(dim=1)
+
+    class BirdSEDModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.backbone = timm.create_model(
+                "tf_efficientnet_b0.ns_jft_in1k",
+                pretrained=False,
+                in_chans=1,
+                num_classes=0,
+                global_pool="",
+            )
+            with torch.no_grad():
+                dummy = torch.randn(1, 1, 128, 313)
+                feat = self.backbone(dummy)
+                self.feat_dim = feat.shape[1] * feat.shape[2] if feat.dim() == 4 else feat.shape[-1]
+            self.pool = AttentionPool(self.feat_dim)
+            self.head = nn.Sequential(
+                nn.Linear(self.feat_dim, 512),
+                nn.ReLU(inplace=True),
+                nn.Dropout(0.3),
+                nn.Linear(512, N_CLASSES),
+            )
+
+        def forward(self, x):
+            feat = self.backbone(x)
+            if feat.dim() == 4:
+                b, c, h, w = feat.shape
+                feat = feat.permute(0, 3, 1, 2).reshape(b, w, c * h)
+            elif feat.dim() == 3:
+                feat = feat.permute(0, 2, 1)
+            return self.head(self.pool(feat))
+
+    b0_b3_models = []
+    for sed_dir in OPT["sed_ensemble_dirs"]:
+        if os.path.exists(sed_dir):
+            for fold in [0, 1]:
+                path = f"{sed_dir}/sed_fold{fold}.pt"
+                if os.path.exists(path):
+                    try:
+                        model_sed = _SEDB0()
+                        model_sed.load_state_dict(_torch_load_state(path))
+                        model_sed.eval()
+                        b0_b3_models.append(model_sed)
+                        print(f"  loaded B0 fold{fold}")
+                    except Exception as exc:
+                        print(f"  B0 fold{fold} skipped: {exc}")
+            path = f"{sed_dir}/sed_b3_fold0.pt"
+            if os.path.exists(path):
+                try:
+                    model_sed = _SEDB3()
+                    model_sed.load_state_dict(_torch_load_state(path))
+                    model_sed.eval()
+                    b0_b3_models.append(model_sed)
+                    print("  loaded B3 fold0")
+                except Exception as exc:
+                    print(f"  B3 skipped: {exc}")
+            break
+
+    v5_models = []
+    v5_names = [
+        "best_model_v5_focal.pt",
+        "best_model_ce_s123.pt",
+        "best_model_ce_s456.pt",
+        "v5_pseudo.pt",
+        "v5_pseudo2.pt",
+    ]
+    for v5_dir in OPT["sed_v5_dirs"]:
+        if os.path.exists(v5_dir):
+            for name in v5_names:
+                path = f"{v5_dir}/{name}"
+                if os.path.exists(path):
+                    try:
+                        model_sed = BirdSEDModel()
+                        model_sed.load_state_dict(_torch_load_state(path))
+                        model_sed.eval()
+                        v5_models.append(model_sed)
+                        print(f"  loaded {name}")
+                    except Exception as exc:
+                        print(f"  {name} skipped: {exc}")
+            break
+
+    n_sed = len(b0_b3_models) + len(v5_models)
+    print(f"SED models loaded: {n_sed} (B0/B3={len(b0_b3_models)}, v5={len(v5_models)})")
+    if n_sed == 0:
+        print("SED rank ensemble skipped: no SED weight files found")
+        return probs_in
+
+    mel_224 = torchaudio.transforms.MelSpectrogram(
+        sample_rate=SR,
+        n_fft=2048,
+        hop_length=512,
+        n_mels=224,
+        f_min=20,
+        f_max=16000,
+    )
+    amp_to_db_224 = torchaudio.transforms.AmplitudeToDB(top_db=80)
+
+    def _mel_128_v5(y):
+        spec = librosa.feature.melspectrogram(
+            y=y,
+            sr=SR,
+            n_fft=2048,
+            hop_length=512,
+            n_mels=128,
+            fmin=20,
+            fmax=16000,
+        )
+        spec_db = librosa.power_to_db(spec, ref=np.max)
+        spec_db = (spec_db + 80.0) / 80.0
+        spec_db = np.clip(spec_db, 0.0, 1.0)
+        return torch.from_numpy(spec_db[np.newaxis, np.newaxis, :, :]).float()
+
+    sed_probs = np.zeros_like(probs_in, dtype=np.float32)
+    for file_i, path in enumerate(test_paths):
+        y = read_60s(path).astype(np.float32)
+        pred_views = []
+
+        if b0_b3_models:
+            mel_windows = []
+            for win_i in range(N_WINDOWS):
+                chunk = y[win_i * WINDOW_SAMPLES:(win_i + 1) * WINDOW_SAMPLES]
+                yt = torch.tensor(chunk, dtype=torch.float32).unsqueeze(0)
+                mel = amp_to_db_224(mel_224(yt))
+                mel = (mel - mel.mean()) / (mel.std() + 1e-8)
+                mel_windows.append(mel)
+            batch = torch.cat(mel_windows, dim=0).unsqueeze(1).expand(-1, 3, -1, -1)
+            with torch.no_grad():
+                for model_sed in b0_b3_models:
+                    pred_views.append(torch.sigmoid(model_sed(batch)).cpu().numpy())
+
+        if v5_models:
+            v5_batch = []
+            for win_i in range(N_WINDOWS):
+                chunk = y[win_i * WINDOW_SAMPLES:(win_i + 1) * WINDOW_SAMPLES]
+                if len(chunk) < WINDOW_SAMPLES:
+                    chunk = np.pad(chunk, (0, WINDOW_SAMPLES - len(chunk)))
+                v5_batch.append(_mel_128_v5(chunk))
+            batch = torch.cat(v5_batch, dim=0)
+            with torch.no_grad():
+                for model_sed in v5_models:
+                    pred_views.append(torch.sigmoid(model_sed(batch)).cpu().numpy())
+
+        if pred_views:
+            sed_probs[file_i * N_WINDOWS:(file_i + 1) * N_WINDOWS] = np.mean(
+                np.stack(pred_views), axis=0
+            )
+        if (file_i + 1) % 100 == 0:
+            print(f"  SED: {file_i+1}/{len(test_paths)} ({time.time()-sed_start:.0f}s)")
+
+    print(f"SED inference done ({time.time()-sed_start:.1f}s)")
+
+    perch_w = float(OPT.get("sed_rank_weight_perch", 0.70))
+    sed_w = float(OPT.get("sed_rank_weight_sed", 0.30))
+    rank_probs = probs_in.copy().astype(np.float32)
+    denom = float(len(rank_probs))
+    for class_i in range(N_CLASSES):
+        perch_rank = rankdata(rank_probs[:, class_i])
+        sed_rank = rankdata(sed_probs[:, class_i])
+        rank_probs[:, class_i] = (perch_w * perch_rank + sed_w * sed_rank) / denom
+    rank_probs = np.clip(rank_probs, 0.0, 1.0)
+    print(f"SED rank average applied: Perch={perch_w:.2f}, SED={sed_w:.2f}")
+
+    if OPT.get("sed_mirror_sonotypes", True):
+        mirror_pairs = (
+            ("47158son15", "47158son16"),
+            ("47158son09", "47158son12"),
+            ("47158son02", "47158son14"),
+            ("47158son13", "47158son21", "47158son22", "47158son23"),
+        )
+        label_to_i = {label: i for i, label in enumerate(PRIMARY_LABELS)}
+        mirrored = 0
+        for group in mirror_pairs:
+            idx = [label_to_i[label] for label in group if label in label_to_i]
+            if len(idx) >= 2:
+                max_val = rank_probs[:, idx].max(axis=1, keepdims=True)
+                rank_probs[:, idx] = max_val
+                mirrored += 1
+        print(f"Sonotype mirroring applied: {mirrored} groups")
+
+    del b0_b3_models, v5_models, sed_probs
+    gc.collect()
+    return rank_probs.astype(np.float32)
+
+probs = apply_optional_sed_rank_ensemble(probs)
 
 # ── Step J: Build submission ───────────────────────────────────────────
 sub = pd.DataFrame(probs.astype(np.float32), columns=PRIMARY_LABELS)

@@ -59,6 +59,8 @@
 | `rishikeshjani/perch-onnx-for-birdclef-2026` | Perch v2 的 ONNX 版本和 ONNX Runtime wheel，用于更快的 CPU 推理。 |
 | `jaejohn/perch-meta` | 预计算的 Perch 训练缓存，包含训练集窗口的 Perch logits、embeddings 和元数据。 |
 | `ashok205/tf-wheels` | Kaggle 离线环境使用的 TensorFlow/TensorBoard wheel。 |
+| `needless090/birdclef2026-sed-ensemble` | 可选 SED 外部模型，包含 EfficientNet B0/B3 fold 权重。 |
+| `needless090/birdclef2026-sed-v5-trio` | 可选 SED 外部模型，包含 v5、CE seed、pseudo、pseudo2 权重。 |
 
 ## 模型是什么
 
@@ -76,6 +78,7 @@ OGG 音频
   -> ResidualSSM 二次误差修正
   -> temperature scaling + sigmoid
   -> 文件级置信度缩放、rank-aware scaling、自适应时序平滑、阈值锐化
+  -> 可选 SED ensemble rank average + sonotype mirroring
   -> submission.csv
 ```
 
@@ -215,6 +218,23 @@ final_scores = first_pass_flat + correction_weight * correction_flat
 4. **rank_aware_scaling**：用每个文件最大置信度进一步压制不确定文件。
 5. **adaptive_delta_smooth**：对低置信度窗口做更多相邻窗口平滑，对高置信度窗口尽量少动。
 6. **apply_per_class_thresholds**：根据训练预测估计的每类阈值，把阈值以上的概率推高、阈值以下的概率压低。
+
+### 9. 可选 SED rank ensemble
+
+当前版本还移植了另一个 LB 0.934 notebook 中最关键的外部 SED 集成模块。它由 `OPT["use_sed_rank_ensemble"]` 控制，默认开启，但只有在 Kaggle notebook 中挂载对应权重数据集时才会实际运行；如果找不到权重或缺少依赖，会自动打印原因并跳过。
+
+SED 分支会加载两组外部模型：
+
+- `birdclef2026-sed-ensemble`：`sed_fold0.pt`、`sed_fold1.pt`、`sed_b3_fold0.pt`。
+- `birdclef2026-sed-v5-trio`：`best_model_v5_focal.pt`、`best_model_ce_s123.pt`、`best_model_ce_s456.pt`、`v5_pseudo.pt`、`v5_pseudo2.pt`。
+
+这些模型直接对 5 秒窗口的 mel spectrogram 做预测，然后与 Perch/ProtoSSM 管线输出做按类别的 rank average：
+
+```text
+final_rank = 0.70 * Perch/ProtoSSM rank + 0.30 * SED rank
+```
+
+之后还会对若干容易混淆的 `sonotype` 标签组做 mirroring：同一组内取最大概率并同步到组内其它标签。这一步是为了利用相近声型标签之间的相关性。
 
 ## 代码执行流程
 
