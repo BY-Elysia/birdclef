@@ -1831,12 +1831,21 @@ def sigmoid(x):
     return 1.0 / (1.0 + np.exp(-np.clip(x, -30, 30)))
 
 # Centralized high-impact knobs for LB/OOF ablations.
-# The default change vs the original notebook is TEST ProtoSSM TTA.
+# Max-upside internal route: multi-seed ProtoSSM + ResidualSSM ensemble.
 OPT = {
     # TEST TTA did not improve the first submission, so keep it off by default.
     "use_test_proto_tta": False,
     "proto_tta_shifts": [0, 1, -1, 2, -2],
     "proto_tta_weights": [0.50, 0.18, 0.18, 0.07, 0.07],
+
+    # Multi-seed SSM ensemble. This is slower, but it is the largest internal
+    # improvement lever because it changes ranking through independently trained models.
+    "use_multi_seed_ssm": True,
+    "ssm_seeds": [42, 777, 2026],
+    "proto_epochs": 40,
+    "proto_patience": 8,
+    "residual_epochs": 30,
+    "residual_patience": 8,
 
     # Base training/inference knobs.
     "lambda_prior": 0.4,
@@ -1849,8 +1858,7 @@ OPT = {
     "rank_power": 0.4,
     "smooth_alpha": 0.20,
 
-    # Cheap ensemble: reuse the same Proto/MLP/Residual outputs and average
-    # several ranking variants. This costs little compared with multi-seed retraining.
+    # Cheap config ensemble layered on top of the seed ensemble.
     "use_config_ensemble": True,
     "ensemble_configs": [
         {
@@ -1891,10 +1899,8 @@ OPT = {
         },
     ],
 
-    # Optional SED ensemble from the 0.934 notebook. Attach these datasets on Kaggle:
-    # - needless090/birdclef2026-sed-ensemble
-    # - needless090/birdclef2026-sed-v5-trio
-    "use_sed_rank_ensemble": True,
+    # External/private routes are disabled for this version.
+    "use_sed_rank_ensemble": False,
     "sed_rank_weight_perch": 0.70,
     "sed_rank_weight_sed": 0.30,
     "sed_ensemble_dirs": [
@@ -1906,63 +1912,73 @@ OPT = {
         "/kaggle/input/birdclef2026-sed-v5-trio",
     ],
     "sed_mirror_sonotypes": True,
-
-    # Fallback when SED weights are private/unavailable: blend with a mounted
-    # public notebook submission only if row_id and columns exactly match.
-    "use_external_submission_rank_blend": True,
+    "use_external_submission_rank_blend": False,
     "external_submission_rank_weight_current": 0.35,
     "external_submission_rank_weight_external": 0.65,
+
+    # Independent, low-cost postprocess from the 0.934 notebook.
+    "use_sonotype_mirroring": True,
 }
 print("OPT knobs:", OPT)
 
-# ── Step A: Train LightProtoSSM ────────────────────────────────────────
-t0 = time.time()
-proto_model, site2i_tr = train_light_proto_ssm(
-    emb_tr, sc_tr, Y_FULL_aligned, meta_tr,
-    n_epochs=40, patience=8, lr=1e-3, verbose=False)
-print(f"ProtoSSM training: {time.time()-t0:.1f}s")
 
-# ── Step B: Run ProtoSSM on TEST ───────────────────────────────────────
-n_test_files  = len(sc_te) // N_WINDOWS
-emb_te_f      = emb_te.reshape(n_test_files, N_WINDOWS, -1)
-sc_te_f       = sc_te.reshape(n_test_files, N_WINDOWS, -1)
+def set_all_seeds(seed):
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
-test_fnames   = meta_te.drop_duplicates("filename")["filename"].tolist()
-n_sites_cap   = 20
-test_site_ids = np.array([
-    min(site2i_tr.get(
-        meta_te.loc[meta_te["filename"]==fn,"site"].iloc[0], 0),
-        n_sites_cap-1)
-    for fn in test_fnames], dtype=np.int64)
-test_hour_ids = np.array([
-    int(meta_te.loc[meta_te["filename"]==fn,"hour_utc"].iloc[0]) % 24
-    for fn in test_fnames], dtype=np.int64)
 
-if OPT["use_test_proto_tta"]:
-    proto_out = run_tta_proto(
-        proto_model,
-        emb_te_f,
-        sc_te_f,
-        site_t=torch.tensor(test_site_ids, dtype=torch.long),
-        hour_t=torch.tensor(test_hour_ids, dtype=torch.long),
-        shifts=OPT["proto_tta_shifts"],
-        weights=OPT["proto_tta_weights"],
-    )
-else:
+def build_site_hour_ids(meta_df, fnames, site2i, n_sites_cap=20):
+    site_ids = np.array([
+        min(site2i.get(meta_df.loc[meta_df["filename"] == fn, "site"].iloc[0], 0), n_sites_cap - 1)
+        for fn in fnames
+    ], dtype=np.int64)
+    hour_ids = np.array([
+        int(meta_df.loc[meta_df["filename"] == fn, "hour_utc"].iloc[0]) % 24
+        for fn in fnames
+    ], dtype=np.int64)
+    return site_ids, hour_ids
+
+
+def run_proto_inference(proto_model, emb_files, sc_files, site_ids, hour_ids):
+    if OPT["use_test_proto_tta"]:
+        return run_tta_proto(
+            proto_model,
+            emb_files,
+            sc_files,
+            site_t=torch.tensor(site_ids, dtype=torch.long),
+            hour_t=torch.tensor(hour_ids, dtype=torch.long),
+            shifts=OPT["proto_tta_shifts"],
+            weights=OPT["proto_tta_weights"],
+        )
+
     proto_model.eval()
     with torch.no_grad():
-        proto_out = proto_model(
-            torch.tensor(emb_te_f, dtype=torch.float32),
-            torch.tensor(sc_te_f,  dtype=torch.float32),
-            site_ids=torch.tensor(test_site_ids, dtype=torch.long),
-            hours   =torch.tensor(test_hour_ids, dtype=torch.long),
+        return proto_model(
+            torch.tensor(emb_files, dtype=torch.float32),
+            torch.tensor(sc_files, dtype=torch.float32),
+            site_ids=torch.tensor(site_ids, dtype=torch.long),
+            hours=torch.tensor(hour_ids, dtype=torch.long),
         ).numpy()
-print(f"ProtoSSM test inference: {'TTA' if OPT['use_test_proto_tta'] else 'single pass'}")
-proto_scores_flat = proto_out.reshape(-1, N_CLASSES).astype(np.float32)
 
-# ── Step C: Prior tables ───────────────────────────────────────────────
-prior_tables   = build_prior_tables(sc, Y_SC)
-sc_te_adjusted = apply_prior(
+# Prepare test arrays and metadata once.
+n_test_files = len(sc_te) // N_WINDOWS
+emb_te_f = emb_te.reshape(n_test_files, N_WINDOWS, -1)
+sc_te_f = sc_te.reshape(n_test_files, N_WINDOWS, -1)
+test_fnames = meta_te.drop_duplicates("filename")["filename"].tolist()
+
+# Prepare train arrays and metadata once.
+n_tr_files = len(sc_tr) // N_WINDOWS
+emb_tr_f = emb_tr.reshape(n_tr_files, N_WINDOWS, -1)
+sc_tr_f = sc_tr.reshape(n_tr_files, N_WINDOWS, -1)
+tr_fnames = meta_tr.drop_duplicates("filename")["filename"].tolist()
+
+# Common prior and MLP branch shared by all SSM seeds.
+prior_tables = build_prior_tables(sc, Y_SC)
+sc_te_prior = apply_prior(
     sc_te,
     sites=meta_te["site"].to_numpy(),
     hours=meta_te["hour_utc"].to_numpy(),
@@ -1970,61 +1986,24 @@ sc_te_adjusted = apply_prior(
     lambda_prior=OPT["lambda_prior"],
 )
 
-# ── Step D: MLP probes ─────────────────────────────────────────────────
 probe_models, emb_scaler, emb_pca, alpha_blend = train_mlp_probes(
-    emb=emb_tr, scores_raw=sc_tr, Y=Y_FULL_aligned,
-    min_pos=5, pca_dim=64, alpha_blend=OPT["mlp_alpha_blend"],
+    emb=emb_tr,
+    scores_raw=sc_tr,
+    Y=Y_FULL_aligned,
+    min_pos=5,
+    pca_dim=64,
+    alpha_blend=OPT["mlp_alpha_blend"],
 )
 sc_te_adjusted = apply_mlp_probes_vectorized(
-    emb_te, sc_te_adjusted,
-    probe_models, emb_scaler, emb_pca, alpha_blend,
+    emb_te,
+    sc_te_prior,
+    probe_models,
+    emb_scaler,
+    emb_pca,
+    alpha_blend,
 )
 
-# ── Step E: First-pass ensemble (ProtoSSM + MLP) ───────────────────────
-ENSEMBLE_W      = OPT["ensemble_w"]
-first_pass_flat = (ENSEMBLE_W * proto_scores_flat
-                   + (1.0 - ENSEMBLE_W) * sc_te_adjusted)
-
-# ── Step F: ResidualSSM (second-pass correction) ───────────────────────
-# Build training-data first-pass scores for residual training
-n_tr_files    = len(sc_tr) // N_WINDOWS
-emb_tr_f      = emb_tr.reshape(n_tr_files, N_WINDOWS, -1)
-sc_tr_f       = sc_tr.reshape(n_tr_files, N_WINDOWS, -1)
-
-tr_fnames     = meta_tr.drop_duplicates("filename")["filename"].tolist()
-tr_site_ids   = np.array([
-    min(site2i_tr.get(
-        meta_tr.loc[meta_tr["filename"]==fn,"site"].iloc[0], 0),
-        n_sites_cap-1)
-    for fn in tr_fnames], dtype=np.int64)
-tr_hour_ids   = np.array([
-    int(meta_tr.loc[meta_tr["filename"]==fn,"hour_utc"].iloc[0]) % 24
-    for fn in tr_fnames], dtype=np.int64)
-
-
-# Get ProtoSSM scores on training data with the same inference mode as TEST.
-if OPT["use_test_proto_tta"]:
-    proto_tr_out = run_tta_proto(
-        proto_model, emb_tr_f, sc_tr_f,
-        site_t=torch.tensor(tr_site_ids, dtype=torch.long),
-        hour_t=torch.tensor(tr_hour_ids, dtype=torch.long),
-        shifts=OPT["proto_tta_shifts"],
-        weights=OPT["proto_tta_weights"],
-    )
-else:
-    proto_model.eval()
-    with torch.no_grad():
-        proto_tr_out = proto_model(
-            torch.tensor(emb_tr_f, dtype=torch.float32),
-            torch.tensor(sc_tr_f, dtype=torch.float32),
-            site_ids=torch.tensor(tr_site_ids, dtype=torch.long),
-            hours=torch.tensor(tr_hour_ids, dtype=torch.long),
-        ).numpy()
-
-proto_tr_flat = proto_tr_out.reshape(-1, N_CLASSES).astype(np.float32)
-
-# Get MLP scores on training data
-sc_tr_prior   = apply_prior(
+sc_tr_prior = apply_prior(
     sc_tr,
     sites=meta_tr["site"].to_numpy(),
     hours=meta_tr["hour_utc"].to_numpy(),
@@ -2032,13 +2011,97 @@ sc_tr_prior   = apply_prior(
     lambda_prior=OPT["lambda_prior"],
 )
 sc_tr_mlp = apply_mlp_probes_vectorized(
-    emb_tr, sc_tr_prior,
-    probe_models, emb_scaler, emb_pca, alpha_blend,
+    emb_tr,
+    sc_tr_prior,
+    probe_models,
+    emb_scaler,
+    emb_pca,
+    alpha_blend,
 )
-first_pass_tr = (ENSEMBLE_W * proto_tr_flat
-                 + (1.0 - ENSEMBLE_W) * sc_tr_mlp)
 
-train_probs_for_calib = sigmoid(first_pass_tr)
+ENSEMBLE_W = OPT["ensemble_w"]
+seeds = OPT["ssm_seeds"] if OPT["use_multi_seed_ssm"] else [OPT["ssm_seeds"][0]]
+seed_components = []
+first_pass_tr_views = []
+
+for seed_i, seed in enumerate(seeds, 1):
+    print(f"\n=== SSM seed {seed_i}/{len(seeds)}: {seed} ===")
+    set_all_seeds(seed)
+
+    t0 = time.time()
+    proto_model, site2i_tr = train_light_proto_ssm(
+        emb_tr,
+        sc_tr,
+        Y_FULL_aligned,
+        meta_tr,
+        n_epochs=OPT["proto_epochs"],
+        patience=OPT["proto_patience"],
+        lr=1e-3,
+        verbose=False,
+    )
+    print(f"ProtoSSM seed {seed} training: {time.time() - t0:.1f}s")
+
+    test_site_ids, test_hour_ids = build_site_hour_ids(meta_te, test_fnames, site2i_tr)
+    tr_site_ids, tr_hour_ids = build_site_hour_ids(meta_tr, tr_fnames, site2i_tr)
+
+    proto_out = run_proto_inference(proto_model, emb_te_f, sc_te_f, test_site_ids, test_hour_ids)
+    proto_scores_seed = proto_out.reshape(-1, N_CLASSES).astype(np.float32)
+    print(f"ProtoSSM seed {seed} test inference: {'TTA' if OPT['use_test_proto_tta'] else 'single pass'}")
+
+    proto_tr_out = run_proto_inference(proto_model, emb_tr_f, sc_tr_f, tr_site_ids, tr_hour_ids)
+    proto_tr_seed = proto_tr_out.reshape(-1, N_CLASSES).astype(np.float32)
+
+    first_pass_tr_seed = (
+        ENSEMBLE_W * proto_tr_seed
+        + (1.0 - ENSEMBLE_W) * sc_tr_mlp
+    ).astype(np.float32)
+    first_pass_te_seed = (
+        ENSEMBLE_W * proto_scores_seed
+        + (1.0 - ENSEMBLE_W) * sc_te_adjusted
+    ).astype(np.float32)
+    first_pass_tr_views.append(first_pass_tr_seed)
+
+    set_all_seeds(seed + 10000)
+    t0 = time.time()
+    res_model, correction_weight = train_residual_ssm(
+        emb_full=emb_tr,
+        first_pass_flat=first_pass_tr_seed,
+        Y_full=Y_FULL_aligned,
+        site_ids=tr_site_ids,
+        hour_ids=tr_hour_ids,
+        n_epochs=OPT["residual_epochs"],
+        patience=OPT["residual_patience"],
+        lr=1e-3,
+        correction_weight=OPT["residual_correction_weight"],
+        verbose=False,
+    )
+    print(f"ResidualSSM seed {seed} training: {time.time() - t0:.1f}s")
+
+    first_pass_te_files = first_pass_te_seed.reshape(n_test_files, N_WINDOWS, -1)
+    res_model.eval()
+    with torch.no_grad():
+        test_correction = res_model(
+            torch.tensor(emb_te_f, dtype=torch.float32),
+            torch.tensor(first_pass_te_files, dtype=torch.float32),
+            site_ids=torch.tensor(test_site_ids, dtype=torch.long),
+            hours=torch.tensor(test_hour_ids, dtype=torch.long),
+        ).numpy()
+    correction_seed = test_correction.reshape(-1, N_CLASSES).astype(np.float32)
+
+    seed_components.append({
+        "seed": seed,
+        "proto_scores_flat": proto_scores_seed,
+        "correction_flat": correction_seed,
+        "correction_weight": correction_weight,
+    })
+    print(
+        f"Seed {seed} correction: mean_abs={np.abs(correction_seed).mean():.4f}, "
+        f"max={np.abs(correction_seed).max():.4f}"
+    )
+
+# Calibrate thresholds from the seed-averaged first-pass training scores.
+first_pass_tr_for_calib = np.mean(first_pass_tr_views, axis=0).astype(np.float32)
+train_probs_for_calib = sigmoid(first_pass_tr_for_calib)
 PER_CLASS_THRESHOLDS = calibrate_and_optimize_thresholds(
     oof_probs=train_probs_for_calib,
     Y_FULL=Y_FULL_aligned,
@@ -2046,44 +2109,22 @@ PER_CLASS_THRESHOLDS = calibrate_and_optimize_thresholds(
     n_windows=N_WINDOWS,
 )
 
-
-# Train ResidualSSM on training errors
-t0 = time.time()
-res_model, correction_weight = train_residual_ssm(
-    emb_full=emb_tr,
-    first_pass_flat=first_pass_tr,
-    Y_full=Y_FULL_aligned,
-    site_ids=tr_site_ids,
-    hour_ids=tr_hour_ids,
-    n_epochs=30,
-    patience=8,
-    lr=1e-3,
-    correction_weight=OPT["residual_correction_weight"],
-    verbose=False,
+# Compatibility variables for diagnostics and optional downstream code.
+proto_scores_flat = np.mean([c["proto_scores_flat"] for c in seed_components], axis=0).astype(np.float32)
+correction_flat = np.mean([c["correction_flat"] for c in seed_components], axis=0).astype(np.float32)
+base_final_scores = (
+    ENSEMBLE_W * proto_scores_flat
+    + (1.0 - ENSEMBLE_W) * sc_te_adjusted
+    + OPT["residual_correction_weight"] * correction_flat
 )
-print(f"ResidualSSM training: {time.time()-t0:.1f}s")
+print(
+    f"\nMulti-seed SSM ensemble: {len(seed_components)} seeds, "
+    f"score range [{base_final_scores.min():.3f}, {base_final_scores.max():.3f}]"
+)
 
-# Apply ResidualSSM correction to TEST scores
-first_pass_te_f  = first_pass_flat.reshape(n_test_files, N_WINDOWS, -1)
-res_model.eval()
-with torch.no_grad():
-    test_correction = res_model(
-        torch.tensor(emb_te_f,         dtype=torch.float32),
-        torch.tensor(first_pass_te_f,  dtype=torch.float32),
-        site_ids=torch.tensor(test_site_ids, dtype=torch.long),
-        hours   =torch.tensor(test_hour_ids, dtype=torch.long),
-    ).numpy()
-
-correction_flat = test_correction.reshape(-1, N_CLASSES).astype(np.float32)
-base_final_scores = first_pass_flat + correction_weight * correction_flat
-
-print(f"Correction applied - "
-      f"mean_abs={np.abs(correction_flat).mean():.4f}  "
-      f"score range [{base_final_scores.min():.3f}, {base_final_scores.max():.3f}]")
-
-# Step G-I: Config ensemble + post-processing
-def make_probs_from_components(cfg):
-    """Build one probability view from shared Proto/MLP/Residual components."""
+# Config ensemble + post-processing.
+def make_probs_from_components(cfg, comp):
+    """Build one probability view from one seed's Proto/MLP/Residual components."""
     w = float(cfg.get("ensemble_w", OPT["ensemble_w"]))
     corr_w = float(cfg.get(
         "residual_correction_weight",
@@ -2092,9 +2133,9 @@ def make_probs_from_components(cfg):
     temp_scale = float(cfg.get("temperature_scale", 1.0))
 
     scores = (
-        w * proto_scores_flat
+        w * comp["proto_scores_flat"]
         + (1.0 - w) * sc_te_adjusted
-        + corr_w * correction_flat
+        + corr_w * comp["correction_flat"]
     )
     scores = scores / (temperatures[None, :] * temp_scale)
 
@@ -2123,19 +2164,45 @@ def make_probs_from_components(cfg):
 
 if OPT["use_config_ensemble"]:
     probs_views = []
-    for cfg in OPT["ensemble_configs"]:
-        p = make_probs_from_components(cfg)
-        probs_views.append(p)
-        print(
-            f"  ensemble view {cfg['name']}: "
-            f"mean={p.mean():.5f} max={p.max():.5f}"
-        )
+    for comp in seed_components:
+        for cfg in OPT["ensemble_configs"]:
+            p = make_probs_from_components(cfg, comp)
+            probs_views.append(p)
+            print(
+                f"  ensemble view seed={comp['seed']} cfg={cfg['name']}: "
+                f"mean={p.mean():.5f} max={p.max():.5f}"
+            )
     probs = np.mean(probs_views, axis=0).astype(np.float32)
     probs = np.clip(probs, 0.0, 1.0)
-    print(f"Config ensemble: averaged {len(probs_views)} views")
+    print(f"Config x seed ensemble: averaged {len(probs_views)} views")
 else:
-    probs = make_probs_from_components({"name": "single"})
+    seed_probs = [make_probs_from_components({"name": "single"}, comp) for comp in seed_components]
+    probs = np.mean(seed_probs, axis=0).astype(np.float32)
+    probs = np.clip(probs, 0.0, 1.0)
 
+
+def apply_sonotype_mirroring(probs_in):
+    if not OPT.get("use_sonotype_mirroring", True):
+        return probs_in
+    mirror_groups = (
+        ("47158son15", "47158son16"),
+        ("47158son09", "47158son12"),
+        ("47158son02", "47158son14"),
+        ("47158son13", "47158son21", "47158son22", "47158son23"),
+    )
+    label_to_i = {label: i for i, label in enumerate(PRIMARY_LABELS)}
+    out = probs_in.copy()
+    mirrored = 0
+    for group in mirror_groups:
+        idx = [label_to_i[label] for label in group if label in label_to_i]
+        if len(idx) >= 2:
+            max_val = out[:, idx].max(axis=1, keepdims=True)
+            out[:, idx] = max_val
+            mirrored += 1
+    print(f"Independent sonotype mirroring applied: {mirrored} groups")
+    return out.astype(np.float32)
+
+probs = apply_sonotype_mirroring(probs)
 
 # Step J: Optional SED rank ensemble from the 0.934 Perch+SED notebook
 # This is skipped automatically unless the external SED weight datasets are attached.

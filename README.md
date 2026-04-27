@@ -78,7 +78,7 @@ OGG 音频
   -> ResidualSSM 二次误差修正
   -> temperature scaling + sigmoid
   -> 文件级置信度缩放、rank-aware scaling、自适应时序平滑、阈值锐化
-  -> 可选 SED ensemble rank average + sonotype mirroring
+  -> 多 seed SSM ensemble + sonotype mirroring
   -> submission.csv
 ```
 
@@ -219,9 +219,31 @@ final_scores = first_pass_flat + correction_weight * correction_flat
 5. **adaptive_delta_smooth**：对低置信度窗口做更多相邻窗口平滑，对高置信度窗口尽量少动。
 6. **apply_per_class_thresholds**：根据训练预测估计的每类阈值，把阈值以上的概率推高、阈值以下的概率压低。
 
-### 9. 可选 SED rank ensemble
+### 9. 多 seed SSM ensemble
 
-当前版本还移植了另一个 LB 0.934 notebook 中最关键的外部 SED 集成模块。它由 `OPT["use_sed_rank_ensemble"]` 控制，默认开启，但只有在 Kaggle notebook 中挂载对应权重数据集时才会实际运行；如果找不到权重或缺少依赖，会自动打印原因并跳过。
+当前版本默认采用不依赖外部私有权重的最大提升路线：`OPT["use_multi_seed_ssm"] = True`。它会共享同一套 Perch、prior 和 MLP probe 输出，但用多个随机种子分别训练 `LightProtoSSM + ResidualSSM`：
+
+```python
+"ssm_seeds": [42, 777, 2026]
+```
+
+每个 seed 都会产生自己的：
+
+- `proto_scores_flat`
+- `correction_flat`
+
+最终会把 `3 个 seed × 4 个后处理配置` 的概率视角平均。相比只调 `rank_power`、`smooth_alpha` 这类后处理参数，多 seed 会改变模型本身的排序，更有机会带来真实 AUC 提升。代价是运行时间约为单 seed 的 2-3 倍。
+
+为了避免使用不可搜索或私有的外部权重，当前默认关闭：
+
+```python
+"use_sed_rank_ensemble": False
+"use_external_submission_rank_blend": False
+```
+
+### 10. 可选 SED rank ensemble
+
+代码仍保留了另一个 LB 0.934 notebook 中的外部 SED 集成模块，供你在能获得权重时手动开启。它由 `OPT["use_sed_rank_ensemble"]` 控制。只有在 Kaggle notebook 中挂载对应权重数据集时才会实际运行；如果找不到权重或缺少依赖，会自动打印原因并跳过。
 
 SED 分支会加载两组外部模型：
 
@@ -236,7 +258,7 @@ final_rank = 0.70 * Perch/ProtoSSM rank + 0.30 * SED rank
 
 之后还会对若干容易混淆的 `sonotype` 标签组做 mirroring：同一组内取最大概率并同步到组内其它标签。这一步是为了利用相近声型标签之间的相关性。
 
-如果上述 SED 权重数据集不可搜索或不可挂载，当前代码还提供一个 fallback：`OPT["use_external_submission_rank_blend"]` 会在 `/kaggle/input/**/submission.csv` 中查找外部 notebook 输出的提交文件。只有当列名、行数和 `row_id` 顺序与当前测试集完全一致时，才会按 rank 与当前预测融合；否则自动跳过。使用这类外部提交融合前，请确认比赛规则允许使用公开 notebook 输出作为输入。
+如果上述 SED 权重数据集不可搜索或不可挂载，代码里也保留了一个外部提交融合 fallback：`OPT["use_external_submission_rank_blend"]`。当前默认关闭。使用这类外部提交融合前，请确认比赛规则允许使用公开 notebook 输出作为输入。
 
 ## 代码执行流程
 
