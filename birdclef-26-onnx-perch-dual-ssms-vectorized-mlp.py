@@ -1906,6 +1906,12 @@ OPT = {
         "/kaggle/input/birdclef2026-sed-v5-trio",
     ],
     "sed_mirror_sonotypes": True,
+
+    # Fallback when SED weights are private/unavailable: blend with a mounted
+    # public notebook submission only if row_id and columns exactly match.
+    "use_external_submission_rank_blend": True,
+    "external_submission_rank_weight_current": 0.35,
+    "external_submission_rank_weight_external": 0.65,
 }
 print("OPT knobs:", OPT)
 
@@ -2396,6 +2402,60 @@ def apply_optional_sed_rank_ensemble(probs_in):
     return rank_probs.astype(np.float32)
 
 probs = apply_optional_sed_rank_ensemble(probs)
+
+# Fallback blend with mounted notebook submission.csv when SED weights are not available.
+def apply_optional_external_submission_rank_blend(probs_in):
+    if not OPT.get("use_external_submission_rank_blend", False):
+        return probs_in
+
+    try:
+        from scipy.stats import rankdata
+    except Exception as exc:
+        print(f"External submission blend skipped: missing scipy ({exc})")
+        return probs_in
+
+    expected_cols = ["row_id"] + PRIMARY_LABELS
+    expected_row_ids = meta_te["row_id"].astype(str).to_numpy()
+    candidates = sorted(Path("/kaggle/input").glob("**/submission.csv"))
+    if not candidates:
+        print("External submission blend skipped: no /kaggle/input/**/submission.csv found")
+        return probs_in
+
+    for cand in candidates:
+        try:
+            ext = pd.read_csv(cand)
+        except Exception as exc:
+            print(f"  external submission unreadable: {cand} ({exc})")
+            continue
+
+        if ext.columns.tolist() != expected_cols:
+            print(f"  external submission skipped (columns mismatch): {cand}")
+            continue
+        if len(ext) != len(expected_row_ids):
+            print(f"  external submission skipped (row count mismatch): {cand}")
+            continue
+        if not np.array_equal(ext["row_id"].astype(str).to_numpy(), expected_row_ids):
+            print(f"  external submission skipped (row_id mismatch): {cand}")
+            continue
+
+        ext_probs = ext[PRIMARY_LABELS].to_numpy(dtype=np.float32)
+        cur_w = float(OPT["external_submission_rank_weight_current"])
+        ext_w = float(OPT["external_submission_rank_weight_external"])
+        blended = np.empty_like(probs_in, dtype=np.float32)
+        denom = float(len(probs_in))
+        for class_i in range(N_CLASSES):
+            cur_rank = rankdata(probs_in[:, class_i])
+            ext_rank = rankdata(ext_probs[:, class_i])
+            blended[:, class_i] = (cur_w * cur_rank + ext_w * ext_rank) / denom
+        blended = np.clip(blended, 0.0, 1.0)
+        print(f"External submission rank blend applied: {cand}")
+        print(f"  weights current={cur_w:.2f}, external={ext_w:.2f}")
+        return blended.astype(np.float32)
+
+    print("External submission blend skipped: no matching submission.csv found")
+    return probs_in
+
+probs = apply_optional_external_submission_rank_blend(probs)
 
 # ── Step J: Build submission ───────────────────────────────────────────
 sub = pd.DataFrame(probs.astype(np.float32), columns=PRIMARY_LABELS)

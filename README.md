@@ -236,6 +236,8 @@ final_rank = 0.70 * Perch/ProtoSSM rank + 0.30 * SED rank
 
 之后还会对若干容易混淆的 `sonotype` 标签组做 mirroring：同一组内取最大概率并同步到组内其它标签。这一步是为了利用相近声型标签之间的相关性。
 
+如果上述 SED 权重数据集不可搜索或不可挂载，当前代码还提供一个 fallback：`OPT["use_external_submission_rank_blend"]` 会在 `/kaggle/input/**/submission.csv` 中查找外部 notebook 输出的提交文件。只有当列名、行数和 `row_id` 顺序与当前测试集完全一致时，才会按 rank 与当前预测融合；否则自动跳过。使用这类外部提交融合前，请确认比赛规则允许使用公开 notebook 输出作为输入。
+
 ## 代码执行流程
 
 | notebook cell | 主要内容 |
