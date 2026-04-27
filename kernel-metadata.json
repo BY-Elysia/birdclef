@@ -1,0 +1,50 @@
+{
+  "languageNullable": "python",
+  "kernelTypeNullable": "notebook",
+  "isPrivateNullable": false,
+  "enableGpuNullable": false,
+  "enableTpuNullable": false,
+  "enableInternetNullable": false,
+  "currentVersionNumberNullable": 5,
+  "dockerImageNullable": "gcr.io/kaggle-images/python@sha256:c370a5ff133d162d17c2dca332b50f3e85c0b0ed1471ee18e98e3009eee80b08",
+  "machineShapeNullable": "None",
+  "id": 116848078,
+  "ref": "yuriygreben/birdclef-26-onnx-perch-dual-ssms-vectorized-mlp",
+  "title": "BirdCLEF+ 26 | ONNX Perch Dual SSMs Vectorized-MLP",
+  "author": "Yuriy Greben",
+  "slug": "birdclef-26-onnx-perch-dual-ssms-vectorized-mlp",
+  "lastRunTime": "2026-04-24T06:09:19.366141Z",
+  "language": "python",
+  "hasLanguage": true,
+  "kernelType": "notebook",
+  "hasKernelType": true,
+  "isPrivate": false,
+  "hasIsPrivate": true,
+  "enableGpu": false,
+  "hasEnableGpu": true,
+  "enableTpu": false,
+  "hasEnableTpu": true,
+  "enableInternet": false,
+  "hasEnableInternet": true,
+  "categoryIds": [],
+  "datasetDataSources": [
+    "jaejohn/perch-meta",
+    "rishikeshjani/perch-onnx-for-birdclef-2026"
+  ],
+  "kernelDataSources": [
+    "ashok205/tf-wheels"
+  ],
+  "competitionDataSources": [
+    "birdclef-2026"
+  ],
+  "modelDataSources": [
+    "google/bird-vocalization-classifier/TensorFlow2/perch_v2_cpu/1"
+  ],
+  "totalVotes": 63,
+  "currentVersionNumber": 5,
+  "hasCurrentVersionNumber": true,
+  "dockerImage": "gcr.io/kaggle-images/python@sha256:c370a5ff133d162d17c2dca332b50f3e85c0b0ed1471ee18e98e3009eee80b08",
+  "hasDockerImage": true,
+  "machineShape": "None",
+  "hasMachineShape": true
+}
