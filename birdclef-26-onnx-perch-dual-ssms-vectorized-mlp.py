@@ -1833,9 +1833,12 @@ def sigmoid(x):
 # Centralized high-impact knobs for LB/OOF ablations.
 # The default change vs the original notebook is TEST ProtoSSM TTA.
 OPT = {
-    "use_test_proto_tta": True,
+    # TEST TTA did not improve the first submission, so keep it off by default.
+    "use_test_proto_tta": False,
     "proto_tta_shifts": [0, 1, -1, 2, -2],
     "proto_tta_weights": [0.50, 0.18, 0.18, 0.07, 0.07],
+
+    # Base training/inference knobs.
     "lambda_prior": 0.4,
     "mlp_alpha_blend": 0.4,
     "ensemble_w": 0.5,
@@ -1845,6 +1848,48 @@ OPT = {
     "file_conf_power": 0.4,
     "rank_power": 0.4,
     "smooth_alpha": 0.20,
+
+    # Cheap ensemble: reuse the same Proto/MLP/Residual outputs and average
+    # several ranking variants. This costs little compared with multi-seed retraining.
+    "use_config_ensemble": True,
+    "ensemble_configs": [
+        {
+            "name": "base",
+            "ensemble_w": 0.50,
+            "residual_correction_weight": 0.30,
+            "file_conf_power": 0.40,
+            "rank_power": 0.40,
+            "smooth_alpha": 0.20,
+            "temperature_scale": 1.00,
+        },
+        {
+            "name": "proto_heavier_less_smooth",
+            "ensemble_w": 0.58,
+            "residual_correction_weight": 0.25,
+            "file_conf_power": 0.32,
+            "rank_power": 0.28,
+            "smooth_alpha": 0.12,
+            "temperature_scale": 1.00,
+        },
+        {
+            "name": "mlp_heavier_stronger_file_prior",
+            "ensemble_w": 0.42,
+            "residual_correction_weight": 0.35,
+            "file_conf_power": 0.48,
+            "rank_power": 0.32,
+            "smooth_alpha": 0.18,
+            "temperature_scale": 1.03,
+        },
+        {
+            "name": "conservative_postprocess",
+            "ensemble_w": 0.50,
+            "residual_correction_weight": 0.18,
+            "file_conf_power": 0.24,
+            "rank_power": 0.18,
+            "smooth_alpha": 0.08,
+            "temperature_scale": 0.98,
+        },
+    ],
 }
 print("OPT knobs:", OPT)
 
@@ -1935,15 +1980,24 @@ tr_hour_ids   = np.array([
     for fn in tr_fnames], dtype=np.int64)
 
 
-# Get ProtoSSM scores on training data
-# CORRECT — using emb_tr_f, sc_tr_f, tr_site_ids (train data)
-proto_tr_out = run_tta_proto(
-    proto_model, emb_tr_f, sc_tr_f,
-    site_t=torch.tensor(tr_site_ids, dtype=torch.long),
-    hour_t=torch.tensor(tr_hour_ids, dtype=torch.long),
-    shifts=OPT["proto_tta_shifts"],
-    weights=OPT["proto_tta_weights"],
-)
+# Get ProtoSSM scores on training data with the same inference mode as TEST.
+if OPT["use_test_proto_tta"]:
+    proto_tr_out = run_tta_proto(
+        proto_model, emb_tr_f, sc_tr_f,
+        site_t=torch.tensor(tr_site_ids, dtype=torch.long),
+        hour_t=torch.tensor(tr_hour_ids, dtype=torch.long),
+        shifts=OPT["proto_tta_shifts"],
+        weights=OPT["proto_tta_weights"],
+    )
+else:
+    proto_model.eval()
+    with torch.no_grad():
+        proto_tr_out = proto_model(
+            torch.tensor(emb_tr_f, dtype=torch.float32),
+            torch.tensor(sc_tr_f, dtype=torch.float32),
+            site_ids=torch.tensor(tr_site_ids, dtype=torch.long),
+            hours=torch.tensor(tr_hour_ids, dtype=torch.long),
+        ).numpy()
 
 proto_tr_flat = proto_tr_out.reshape(-1, N_CLASSES).astype(np.float32)
 
@@ -1999,29 +2053,66 @@ with torch.no_grad():
     ).numpy()
 
 correction_flat = test_correction.reshape(-1, N_CLASSES).astype(np.float32)
-final_scores    = (first_pass_flat
-                   + correction_weight * correction_flat)
+base_final_scores = first_pass_flat + correction_weight * correction_flat
 
-print(f"Correction applied — "
+print(f"Correction applied - "
       f"mean_abs={np.abs(correction_flat).mean():.4f}  "
-      f"score range [{final_scores.min():.3f}, {final_scores.max():.3f}]")
+      f"score range [{base_final_scores.min():.3f}, {base_final_scores.max():.3f}]")
 
-# ── Step G: Temperature scaling ────────────────────────────────────────
-final_scores = final_scores / temperatures[None, :]
+# Step G-I: Config ensemble + post-processing
+def make_probs_from_components(cfg):
+    """Build one probability view from shared Proto/MLP/Residual components."""
+    w = float(cfg.get("ensemble_w", OPT["ensemble_w"]))
+    corr_w = float(cfg.get(
+        "residual_correction_weight",
+        OPT["residual_correction_weight"],
+    ))
+    temp_scale = float(cfg.get("temperature_scale", 1.0))
 
-# ── Step H: Sigmoid → probabilities ───────────────────────────────────
-probs = sigmoid(final_scores)
+    scores = (
+        w * proto_scores_flat
+        + (1.0 - w) * sc_te_adjusted
+        + corr_w * correction_flat
+    )
+    scores = scores / (temperatures[None, :] * temp_scale)
 
-# ── Step I: Post-processing pipeline ──────────────────────────────────
-probs = file_confidence_scale(probs, n_windows=N_WINDOWS,
-                               top_k=OPT["file_top_k"], power=OPT["file_conf_power"])
-probs = rank_aware_scaling(   probs, n_windows=N_WINDOWS,
-                               power=OPT["rank_power"])
-probs = adaptive_delta_smooth(probs, n_windows=N_WINDOWS,
-                               base_alpha=OPT["smooth_alpha"])
-probs = np.clip(probs, 0.0, 1.0)
+    p = sigmoid(scores)
+    p = file_confidence_scale(
+        p,
+        n_windows=N_WINDOWS,
+        top_k=int(cfg.get("file_top_k", OPT["file_top_k"])),
+        power=float(cfg.get("file_conf_power", OPT["file_conf_power"])),
+    )
+    p = rank_aware_scaling(
+        p,
+        n_windows=N_WINDOWS,
+        power=float(cfg.get("rank_power", OPT["rank_power"])),
+    )
+    p = adaptive_delta_smooth(
+        p,
+        n_windows=N_WINDOWS,
+        base_alpha=float(cfg.get("smooth_alpha", OPT["smooth_alpha"])),
+    )
+    p = np.clip(p, 0.0, 1.0)
 
-probs = apply_per_class_thresholds(probs, PER_CLASS_THRESHOLDS)
+    if cfg.get("apply_thresholds", True):
+        p = apply_per_class_thresholds(p, PER_CLASS_THRESHOLDS)
+    return p.astype(np.float32)
+
+if OPT["use_config_ensemble"]:
+    probs_views = []
+    for cfg in OPT["ensemble_configs"]:
+        p = make_probs_from_components(cfg)
+        probs_views.append(p)
+        print(
+            f"  ensemble view {cfg['name']}: "
+            f"mean={p.mean():.5f} max={p.max():.5f}"
+        )
+    probs = np.mean(probs_views, axis=0).astype(np.float32)
+    probs = np.clip(probs, 0.0, 1.0)
+    print(f"Config ensemble: averaged {len(probs_views)} views")
+else:
+    probs = make_probs_from_components({"name": "single"})
 
 # ── Step J: Build submission ───────────────────────────────────────────
 sub = pd.DataFrame(probs.astype(np.float32), columns=PRIMARY_LABELS)
